@@ -1,0 +1,19 @@
+services:
+  notability-mcp:
+    build: .
+    image: notability-mcp:latest
+    restart: unless-stopped
+    # run as the owner of the backup folder so files Notability uploads belong to you
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file: .env
+    ports:
+      # only Caddy on this host should reach it; TLS is terminated by Caddy
+      - "127.0.0.1:${HOST_PORT:-8080}:8080"
+    volumes:
+      # WebDAV root is /backups; Notability creates its "Notability" folder inside it
+      - ${NOTABILITY_DIR:?set NOTABILITY_DIR in .env}:/backups/Notability
+      # OAuth tokens, text cache, transcripts, whisper models
+      - ./data:/data
+    # whisper on CPU is heavy; keep it from starving the rest of the VM
+    cpus: ${CPU_LIMIT:-2}
+    mem_limit: ${MEM_LIMIT:-4g}
