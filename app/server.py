@@ -36,10 +36,10 @@ oauth = OwnerOAuthProvider(S)
 
 INSTRUCTIONS = """\
 Read-only access to the user's Notability notes (auto-backup). Folders mirror Notability
-subjects/dividers, e.g. "Школа/10 класс/Физика". Each note may have:
-- a PDF (the rendered note). Notes are mostly HANDWRITTEN: the PDF text layer is often empty,
-  so use view_note_pages to look at the pages as images and read the handwriting.
-- an archive (.note/.zip) that can contain audio recordings of the lesson -> get_transcript.
+subjects/dividers, e.g. "Школа/10 класс/Физика". Each note has a PDF and, if something was
+recorded during the lesson, audio recordings (stored in a .zip next to it).
+Notes are mostly HANDWRITTEN: the PDF text layer is often empty, so use view_note_pages to look
+at the pages as images and read the handwriting. Audio -> get_transcript.
 Typical flow: list_notes / recent_notes / search_notes -> read_note -> view_note_pages / get_transcript.
 Note paths are relative to the Notability root and may omit the extension.
 """
@@ -62,15 +62,13 @@ mcp = MCPServer(
 
 def _note_flags(n) -> str:
     flags = []
-    if n.pdf:
+    if n.has_pdf:
         flags.append("pdf")
     if n.archive:
         rec = lib.audio_members(n.archive)
         if rec:
             pending = len(tx.pending_recordings(n.archive)) if tx.enabled else len(rec)
             flags.append(f"audio×{len(rec)}" + ("" if pending == 0 else f" (не расшифровано: {pending})"))
-        else:
-            flags.append("archive")
     return ", ".join(flags)
 
 
@@ -125,7 +123,7 @@ def recent_notes(limit: int = 20, path: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 async def search_notes(query: str, path: str = "", limit: int = 20) -> str:
-    """Full-text search over note names, PDF text, Notability handwriting index and audio transcripts.
+    """Full-text search over note names, PDF text layer and audio transcripts.
     Case-insensitive; all words must match (substring match, so word stems work: "механик").
 
     Args:
@@ -145,14 +143,11 @@ async def search_notes(query: str, path: str = "", limit: int = 20) -> str:
         hits = []
         for n in lib.all_notes(base):
             sources: list[tuple[str, str]] = [("name", lib.note_id(n))]
-            if n.pdf:
-                for i, t in enumerate(lib.pdf_pages_text(n.pdf), 1):
+            if n.has_pdf:
+                for i, t in enumerate(lib.pdf_pages_text(n), 1):
                     if t:
                         sources.append((f"pdf p.{i}", t))
             if n.archive:
-                hw = lib.handwriting_text(n.archive)
-                if hw:
-                    sources.append(("handwriting", hw))
                 if tx.enabled:
                     tr = tx.plain_text(n.archive)
                     if tr:
@@ -180,8 +175,7 @@ async def search_notes(query: str, path: str = "", limit: int = 20) -> str:
 
 @mcp.tool(annotations=RO)
 async def read_note(path: str) -> str:
-    """Everything textual about a note: file info, PDF text layer per page, Notability's
-    handwriting-recognition text (if present in the archive) and transcript status.
+    """Everything textual about a note: file info, PDF text layer per page and transcript status.
     Handwritten pages usually have no text layer: then use view_note_pages.
 
     Args:
@@ -197,19 +191,16 @@ async def read_note(path: str) -> str:
         for f in n.files:
             st = f.stat()
             out.append(f"- {f.name}: {fmt_size(st.st_size)}, modified {fmt_time(st.st_mtime)}")
-        if n.pdf:
-            pages = lib.pdf_pages_text(n.pdf)
+        if n.has_pdf:
+            pages = lib.pdf_pages_text(n)
             total_chars = sum(len(p) for p in pages)
-            out.append(f"\n## PDF: {len(pages)} pages, text layer {total_chars} chars")
+            out.append(f"\n## PDF ({n.pdf_label}): {len(pages)} pages, text layer {total_chars} chars")
             if total_chars < 30 * max(1, len(pages)):
                 out.append("(little or no text layer — the note is handwritten; use view_note_pages)")
             for i, t in enumerate(pages, 1):
                 if t:
                     out.append(f"\n### Page {i}\n{t}")
         if n.archive:
-            hw = lib.handwriting_text(n.archive)
-            if hw:
-                out.append(f"\n## Handwriting index (Notability OCR, unordered)\n{hw[:20000]}")
             rec = lib.audio_members(n.archive)
             if rec:
                 _, done, total = tx.transcript_text(n.archive) if tx.enabled else ("", 0, len(rec))
@@ -232,9 +223,9 @@ async def view_note_pages(path: str, pages: str = "1-3", dpi: int = 110) -> list
         n = lib.note(path)
     except NoteError as e:
         return [f"Error: {e}"]
-    if not n.pdf:
+    if not n.has_pdf:
         return ["This note has no PDF backup."]
-    total = await asyncio.to_thread(lib.page_count, n.pdf)
+    total = await asyncio.to_thread(lib.page_count, n)
     try:
         nums = _parse_pages(pages, total)
     except ValueError as e:
@@ -242,7 +233,7 @@ async def view_note_pages(path: str, pages: str = "1-3", dpi: int = 110) -> list
     if len(nums) > S.max_render_pages:
         return [f"Too many pages ({len(nums)}); request at most {S.max_render_pages} per call. Total pages: {total}."]
     dpi = max(72, min(200, dpi))
-    imgs = await asyncio.to_thread(lib.render_pages, n.pdf, nums, dpi)
+    imgs = await asyncio.to_thread(lib.render_pages, n, nums, dpi)
     result: list = [f"{lib.note_id(n)} — pages {', '.join(map(str, nums))} of {total}"]
     for num, data in zip(nums, imgs):
         result.append(f"Page {num}:")
@@ -266,7 +257,7 @@ async def get_transcript(path: str, wait_seconds: int = 0, timestamps: bool = Tr
     except NoteError as e:
         return f"Error: {e}"
     if not n.archive:
-        return "This note has no archive backup, so there is no audio. (Enable the 'Note' format in Notability auto-backup.)"
+        return "This note has no audio (no .zip backup next to it)."
     if not lib.audio_members(n.archive):
         return "No audio recordings in this note."
     if not tx.enabled:

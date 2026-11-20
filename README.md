@@ -3,7 +3,7 @@
 Один контейнер, один порт (за Caddy):
 
 | Путь | Что | Аутентификация |
-|---|---|---|
+| --- | --- | --- |
 | `/mcp` | MCP-сервер (Streamable HTTP), только чтение | OAuth 2.1 + PKCE, вход по паролю на `/login` |
 | `/dav/` | WebDAV для автобэкапа Notability | Basic auth (поверх TLS от Caddy) |
 | `/healthz` | healthcheck | — |
@@ -15,7 +15,7 @@
 ## Установка на сервере
 
 ```bash
-git clone … notability-mcp && cd notability-mcp
+git clone https://github.com/lev007-ops/notability_mcp notability-mcp && cd notability-mcp
 cp .env.example .env
 mkdir -p data                       # токены, кэш, расшифровки, модели whisper
 id -u; id -g                        # → PUID / PGID в .env
@@ -26,7 +26,7 @@ docker compose run --rm notability-mcp hash-password   # → DAV_PASSWORD_HASH �
 docker compose up -d
 ```
 
-`NOTABILITY_DIR` — это папка `Notability` (например `~/obsidian-mcp/vault/Notability`).
+`NOTABILITY_DIR` — это папка `Notability` (например `~/mcp/vault/Notability`).
 Она монтируется в `/backups/Notability`, а корень WebDAV — `/backups`. Notability сам
 создаёт папку `Notability` в корне WebDAV, поэтому файлы ложатся туда же, где лежат сейчас,
 а остальной vault через WebDAV не виден.
@@ -37,7 +37,7 @@ Caddy на хосте:
 
 ```caddy
 notes.example.com {
-	reverse_proxy 127.0.0.1:8080
+ reverse_proxy 127.0.0.1:8080
 }
 ```
 
@@ -50,10 +50,13 @@ notes.example.com {
 ### Notability
 
 Настройки → Auto-backup → WebDAV:
+
 - Server: `https://notes.example.com/dav`
 - User / Password: `DAV_USER` и пароль, из которого сделан `DAV_PASSWORD_HASH`
-- Формат: **PDF** (для чтения страниц) и **Note** (архив `.note`, внутри аудио и индекс
-  распознанного рукописного текста). Поддерживаются и `.note`, и `.zip`.
+- Формат: **PDF + audio**. Заметка без записей приходит как `<имя>.pdf`, с записями — как
+  `<имя>.zip`, внутри `<имя>/<имя>.pdf` и `<имя>/Recordings/Recording N.m4a`.
+  Если рядом лежат и старый `.pdf`, и `.zip` (например, после смены формата), сервер берёт более
+  свежий PDF.
 
 ### Подключение Claude
 
@@ -69,7 +72,9 @@ notes.example.com {
 
 - `TRANSCRIBER=whisper` — локально, faster-whisper на CPU. `large-v3-turbo` int8 ≈ 2 ГБ RAM;
   на 2 vCPU работает примерно в реальном времени (урок 45 мин ≈ 45 мин). На слабом VPS — `small`.
-  Модель скачивается при первом запуске в `data/models`.
+  Модель скачивается с HuggingFace при первой расшифровке в `data/models`. Если с сервера
+  `curl -I https://huggingface.co` не проходит — задайте зеркало `HF_ENDPOINT=…` в `.env`
+  или положите модель в `data/models` вручную.
 - `TRANSCRIBER=assemblyai` — облако, быстрее и есть разделение по спикерам; нужен
   `ASSEMBLYAI_API_KEY`. После получения текста расшифровка удаляется на стороне AssemblyAI.
 

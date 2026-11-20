@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import shutil
 import tempfile
@@ -88,10 +89,12 @@ class WhisperBackend:
 
 class AssemblyAIBackend:
     name = "assemblyai"
-    base = "https://api.assemblyai.com"
-
     def __init__(self, s: Settings):
         self.s = s
+        # https://api.eu.assemblyai.com to keep data in the EU
+        self.base = os.environ.get("ASSEMBLYAI_BASE_URL", "https://api.assemblyai.com").rstrip("/")
+        # empty = account default model; e.g. "assemblyai-stt-3-7"
+        self.speech_models = [m.strip() for m in os.environ.get("ASSEMBLYAI_SPEECH_MODELS", "").split(",") if m.strip()]
 
     def transcribe(self, audio: Path) -> tuple[list[Segment], str | None]:
         headers = {"authorization": self.s.assemblyai_api_key or ""}
@@ -99,7 +102,10 @@ class AssemblyAIBackend:
             with audio.open("rb") as f:
                 r = c.post("/v2/upload", content=f)
             r.raise_for_status()
-            body: dict = {"audio_url": r.json()["upload_url"], "speaker_labels": True}
+            # speaker_labels requires punctuate=true
+            body: dict = {"audio_url": r.json()["upload_url"], "speaker_labels": True, "punctuate": True}
+            if self.speech_models:
+                body["speech_models"] = self.speech_models
             if self.s.transcribe_language:
                 body["language_code"] = self.s.transcribe_language
             else:

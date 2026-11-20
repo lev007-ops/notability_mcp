@@ -1,13 +1,17 @@
 """Read-only access to the Notability backup tree.
 
-A "note" is a stem inside a folder with any of: `<stem>.pdf` (rendered note) and
-`<stem>.note` / `<stem>.zip` (Notability's native archive: handwriting, images, audio).
+A "note" is a stem inside a folder with any of:
+- `<stem>.pdf`  - auto-backup in "PDF" format (notes without audio);
+- `<stem>.zip`  - auto-backup in "PDF + audio" format: `<stem>/<stem>.pdf` and
+  `<stem>/Recordings/Recording N.m4a` inside;
+- `<stem>.note` - native Notability archive (audio is found the same way).
+When both a standalone PDF and an archive with a PDF exist, the newer one wins:
+switching backup formats leaves stale files behind.
 """
 
 from __future__ import annotations
 
 import json
-import plistlib
 import sqlite3
 import threading
 import zipfile
@@ -18,9 +22,10 @@ from pathlib import Path
 import pymupdf
 
 PDF_EXT = ".pdf"
-ARCHIVE_EXTS = (".note", ".zip")
+ARCHIVE_EXTS = (".zip", ".note")
 AUDIO_EXTS = (".m4a", ".aac", ".caf", ".wav", ".mp3", ".aiff", ".aif", ".mp4", ".ogg", ".opus", ".flac")
 MAX_MEMBER_BYTES = 4 * 1024**3
+MAX_PDF_IN_ARCHIVE = 500 * 1024**2
 
 
 class NoteError(ValueError):
@@ -33,6 +38,19 @@ class Note:
     stem: str
     pdf: Path | None = None
     archive: Path | None = None
+    # resolved by Library.note()/notes_in(): where the PDF to show actually lives
+    pdf_container: Path | None = None
+    pdf_member: str | None = None  # member name inside the archive, None = standalone file
+
+    @property
+    def has_pdf(self) -> bool:
+        return self.pdf_container is not None
+
+    @property
+    def pdf_label(self) -> str:
+        if not self.pdf_container:
+            return ""
+        return f"{self.pdf_container.name} → {self.pdf_member}" if self.pdf_member else self.pdf_container.name
 
     @property
     def files(self) -> list[Path]:
@@ -76,6 +94,8 @@ class Library:
                 notes.setdefault(f.stem, Note(folder, f.stem)).pdf = f
             elif ext in ARCHIVE_EXTS:
                 notes.setdefault(f.stem, Note(folder, f.stem)).archive = f
+        for n in notes.values():
+            self._resolve_pdf(n)
         return sorted(notes.values(), key=lambda n: n.mtime, reverse=True)
 
     def all_notes(self, under: Path | None = None) -> list[Note]:
@@ -95,8 +115,13 @@ class Library:
             stem = p.stem
         if not folder.is_dir():
             raise NoteError(f"folder not found: {self.rel(folder) if folder != self.root else '/'}")
-        for n in self.notes_in(folder):
+        notes = self.notes_in(folder)
+        for n in notes:
             if n.stem == stem:
+                return n
+        # file names like "Физика 10 механика .pdf" have a trailing space that callers drop
+        for n in notes:
+            if n.stem.strip() == stem.strip():
                 return n
         raise NoteError(f"note not found: {rel}")
 
@@ -104,16 +129,63 @@ class Library:
         return self.rel(n.folder / n.stem)
 
     # ---- PDF -------------------------------------------------------------------------------
-    def pdf_pages_text(self, pdf: Path) -> list[str]:
-        return self._text.get(pdf, "pdf", lambda: _extract_pdf_text(pdf))
+    def _resolve_pdf(self, n: Note) -> None:
+        member = self._archive_pdf_member(n.archive) if n.archive else None
+        use_archive = member is not None and (
+            n.pdf is None or n.archive.stat().st_mtime >= n.pdf.stat().st_mtime  # type: ignore[union-attr]
+        )
+        if use_archive:
+            n.pdf_container, n.pdf_member = n.archive, member
+        elif n.pdf:
+            n.pdf_container, n.pdf_member = n.pdf, None
 
-    def page_count(self, pdf: Path) -> int:
-        with pymupdf.open(pdf) as doc:
+    def _archive_pdf_member(self, archive: Path) -> str | None:
+        try:
+            with zipfile.ZipFile(archive) as z:
+                pdfs = [
+                    i
+                    for i in z.infolist()
+                    if not i.is_dir()
+                    and i.filename.lower().endswith(PDF_EXT)
+                    and "__MACOSX" not in i.filename
+                    and 0 < i.file_size <= MAX_PDF_IN_ARCHIVE
+                ]
+        except (zipfile.BadZipFile, OSError):
+            return None
+        if not pdfs:
+            return None
+        # prefer "<stem>/<stem>.pdf", else the largest
+        stem = archive.stem
+        for i in pdfs:
+            if Path(i.filename).stem == stem:
+                return i.filename
+        return max(pdfs, key=lambda i: i.file_size).filename
+
+    def _open_pdf(self, n: Note) -> pymupdf.Document:
+        if not n.pdf_container:
+            raise NoteError("this note has no PDF")
+        if n.pdf_member is None:
+            return pymupdf.open(n.pdf_container)
+        with zipfile.ZipFile(n.pdf_container) as z:
+            return pymupdf.open(stream=z.read(n.pdf_member), filetype="pdf")
+
+    def pdf_pages_text(self, n: Note) -> list[str]:
+        if not n.pdf_container:
+            return []
+
+        def extract() -> list[str]:
+            with self._open_pdf(n) as doc:
+                return [page.get_text().strip() for page in doc]
+
+        return self._text.get(n.pdf_container, f"pdf:{n.pdf_member or ''}", extract)
+
+    def page_count(self, n: Note) -> int:
+        with self._open_pdf(n) as doc:
             return doc.page_count
 
-    def render_pages(self, pdf: Path, pages: list[int], dpi: int) -> list[bytes]:
+    def render_pages(self, n: Note, pages: list[int], dpi: int) -> list[bytes]:
         out = []
-        with pymupdf.open(pdf) as doc:
+        with self._open_pdf(n) as doc:
             for i in pages:
                 page = doc[i - 1]
                 # cap the long side at ~2000 px: enough to read handwriting, cheap in tokens
@@ -145,61 +217,6 @@ class Library:
         with zipfile.ZipFile(archive) as z:
             return [(i.filename, i.file_size) for i in z.infolist() if not i.is_dir()]
 
-    def handwriting_text(self, archive: Path) -> str:
-        """Notability stores its handwriting-recognition index inside the archive
-        (HandwritingIndex/*.plist). Format is undocumented, so collect string values."""
-        return self._text.get(archive, "hw", lambda: [_extract_handwriting(archive)])[0]
-
-
-def _extract_pdf_text(pdf: Path) -> list[str]:
-    with pymupdf.open(pdf) as doc:
-        return [page.get_text().strip() for page in doc]
-
-
-def _extract_handwriting(archive: Path) -> str:
-    chunks: list[str] = []
-    try:
-        with zipfile.ZipFile(archive) as z:
-            for info in z.infolist():
-                name = info.filename.lower()
-                if "handwritingindex" not in name or info.file_size > 50 * 1024**2:
-                    continue
-                if not name.endswith(".plist") and "index" not in name.rsplit("/", 1)[-1]:
-                    continue
-                try:
-                    data = plistlib.loads(z.read(info))
-                except Exception:
-                    continue
-                _collect_strings(data, chunks)
-    except zipfile.BadZipFile:
-        return ""
-    seen, words = set(), []
-    for c in chunks:
-        if c not in seen:
-            seen.add(c)
-            words.append(c)
-    return " ".join(words)
-
-
-def _collect_strings(obj, out: list[str]) -> None:
-    if isinstance(obj, str):
-        s = obj.strip()
-        # skip NSKeyedArchiver class names / keys / uuids
-        if s and not s.startswith(("NS", "$")) and any(ch.isalpha() for ch in s) and not _looks_like_id(s):
-            out.append(s)
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ("$classes", "$classname"):
-                continue
-            _collect_strings(v, out)
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            _collect_strings(v, out)
-
-
-def _looks_like_id(s: str) -> bool:
-    return len(s) >= 32 and all(ch in "0123456789abcdefABCDEF-" for ch in s)
-
 
 class TextCache:
     """Extracted text keyed by (path, kind), invalidated by mtime+size."""
@@ -225,7 +242,7 @@ class TextCache:
         try:
             value = compute()
         except Exception:  # corrupt / half-uploaded file: don't cache, retry next time
-            return [""] if kind == "hw" else []
+            return []
         with self._lock:
             self._db.execute(
                 "INSERT OR REPLACE INTO t VALUES (?, ?, ?, ?, ?)",
